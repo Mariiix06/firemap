@@ -2,6 +2,7 @@ import 'dotenv/config';
 import crypto from 'node:crypto';
 import express from 'express';
 import cors from 'cors';
+import { createClient } from '@supabase/supabase-js';
 
 const app = express();
 app.use(cors(), express.json({ limit: '12mb' })); // 12mb: comporta a imagem da planta enviada em base64
@@ -44,6 +45,26 @@ const usersRepo = {
 };
 const publicUser = u => ({ id: u.id, name: u.name, email: u.email });
 
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+const supabase = supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey, {
+  auth: { persistSession: false, autoRefreshToken: false },
+}) : null;
+const mapDbPlan = row => ({ id: String(row.id), name: row.name, image: row.image });
+const mapDbExtinguisher = row => ({
+  id: String(row.id),
+  code: row.code,
+  type: row.type,
+  location: row.location,
+  planId: String(row.plan_id),
+  x: row.x,
+  y: row.y,
+  expiry: row.expiry,
+  nextMaintenance: row.next_maintenance,
+  maintenancePending: !!row.maintenance_pending,
+});
+const dbError = err => { if (!err) return null; throw new Error(err.message || 'Erro no banco de dados.'); };
+
 // Limite de tentativas de login por IP: 10 falhas / 15 min
 const attempts = new Map();
 const WINDOW = 15 * 60 * 1000, MAX_FAILS = 10;
@@ -84,12 +105,39 @@ const sketch = rooms => 'data:image/svg+xml;base64,' + Buffer.from(
   `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 60" width="1000" height="600"><rect width="100" height="60" fill="#fff"/>` +
   `<rect x=".5" y=".5" width="99" height="59" fill="none" stroke="#22262b" stroke-width="1"/>` +
   rooms.map(r => `<rect x="${r[0]}" y="${r[1]}" width="${r[2]}" height="${r[3]}" fill="#f3f4f6" stroke="#6b7280" stroke-width=".4"/>`).join('') + `</svg>`).toString('base64');
-let pseq = 2;
-let plans = [
+const fallbackPlans = [
   { id: '1', name: 'Térreo', image: sketch([[2, 2, 36, 56], [38, 2, 24, 56], [62, 2, 36, 28], [62, 30, 36, 28]]) },
   { id: '2', name: '1º andar', image: sketch([[2, 2, 30, 56], [32, 2, 36, 30], [32, 32, 36, 26], [68, 2, 30, 56]]) },
 ];
-const plansRepo = {
+let pseq = 2;
+let plans = [...fallbackPlans];
+const plansRepo = supabase ? {
+  list: async () => {
+    const { data, error } = await supabase.from('plans').select('*').order('id', { ascending: true });
+    if (error) throw new Error(error.message);
+    return data.map(mapDbPlan);
+  },
+  get: async id => {
+    const { data, error } = await supabase.from('plans').select('*').eq('id', Number(id)).maybeSingle();
+    if (error && error.code !== 'PGRST116') throw new Error(error.message);
+    return data ? mapDbPlan(data) : null;
+  },
+  create: async p => {
+    const { data, error } = await supabase.from('plans').insert([{ name: p.name, image: p.image }]).select().single();
+    if (error) throw new Error(error.message);
+    return mapDbPlan(data);
+  },
+  update: async (id, p) => {
+    const { data, error } = await supabase.from('plans').update({ name: p.name, ...(p.image ? { image: p.image } : {}) }).eq('id', Number(id)).select().single();
+    if (error) throw new Error(error.message);
+    return mapDbPlan(data);
+  },
+  remove: async id => {
+    const { error } = await supabase.from('plans').delete().eq('id', Number(id));
+    if (error) throw new Error(error.message);
+    return true;
+  },
+} : {
   list: async () => plans,
   get: async id => plans.find(p => p.id === id),
   create: async p => { const n = { ...p, id: String(++pseq) }; plans.push(n); return n; },
@@ -114,7 +162,55 @@ let data = [
   id: String(i + 1), code: `EXT-${String(i + 1).padStart(3, '0')}`, type: r[0], location: r[1],
   planId: String(r[2] + 1), x: r[3], y: r[4], expiry: iso(r[5]), nextMaintenance: iso(r[6]), maintenancePending: r[7],
 }));
-const repo = {
+const repo = supabase ? {
+  list: async () => {
+    const { data: rows, error } = await supabase.from('extinguishers').select('*').order('id', { ascending: true });
+    if (error) throw new Error(error.message);
+    return rows.map(mapDbExtinguisher);
+  },
+  get: async id => {
+    const { data, error } = await supabase.from('extinguishers').select('*').eq('id', Number(id)).maybeSingle();
+    if (error && error.code !== 'PGRST116') throw new Error(error.message);
+    return data ? mapDbExtinguisher(data) : null;
+  },
+  create: async e => {
+    const payload = {
+      code: e.code || `EXT-${Date.now()}`,
+      type: e.type,
+      location: e.location,
+      plan_id: Number(e.planId),
+      x: Number(e.x || 0),
+      y: Number(e.y || 0),
+      expiry: e.expiry,
+      next_maintenance: e.nextMaintenance || null,
+      maintenance_pending: !!e.maintenancePending,
+    };
+    const { data, error } = await supabase.from('extinguishers').insert([payload]).select().single();
+    if (error) throw new Error(error.message);
+    return mapDbExtinguisher(data);
+  },
+  update: async (id, e) => {
+    const payload = {
+      code: e.code,
+      type: e.type,
+      location: e.location,
+      plan_id: Number(e.planId),
+      x: Number(e.x || 0),
+      y: Number(e.y || 0),
+      expiry: e.expiry,
+      next_maintenance: e.nextMaintenance || null,
+      maintenance_pending: !!e.maintenancePending,
+    };
+    const { data, error } = await supabase.from('extinguishers').update(payload).eq('id', Number(id)).select().single();
+    if (error) throw new Error(error.message);
+    return mapDbExtinguisher(data);
+  },
+  remove: async id => {
+    const { error } = await supabase.from('extinguishers').delete().eq('id', Number(id));
+    if (error) throw new Error(error.message);
+    return true;
+  },
+} : {
   list: async () => data,
   get: async id => data.find(e => e.id === id),
   create: async e => { const n = { ...e, id: String(++seq) }; n.code ||= `EXT-${String(seq).padStart(3, '0')}`; data.push(n); return n; },
